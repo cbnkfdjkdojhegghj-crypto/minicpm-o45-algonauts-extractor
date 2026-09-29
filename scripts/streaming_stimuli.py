@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
-"""Streaming access to Algonauts 2025 stimulus files via git-annex.
+"""Streaming access to Algonauts 2025 stimulus files via DataLad.
 
 This module deliberately contains no feature-extraction logic. It only:
-- clones/initialises the Algonauts competitors dataset,
-- enables the remotes used by the tested streaming workflow,
+- installs/initialises the Algonauts competitors dataset using DataLad,
 - discovers movie/transcript files by episode,
-- materialises selected episode files with git-annex,
-- and safely returns them to annex symlinks after use.
+- materialises selected episode files with datalad get,
+- and safely drops them after use with datalad drop.
 
 Downstream extractors should import the functions here rather than copying the
 dataset/download logic.
@@ -20,7 +19,6 @@ import re
 import shutil
 import subprocess
 import sys
-from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Iterator
@@ -57,12 +55,16 @@ def run_optional(cmd: list[str], *, cwd: Path | None = None) -> bool:
 
 
 def require_commands() -> None:
-    missing = [name for name in ("git", "git-annex") if shutil.which(name) is None]
+    missing = [
+        name
+        for name in ("git", "git-annex", "datalad")
+        if shutil.which(name) is None
+    ]
     if missing:
         raise RuntimeError(
             "Missing required commands: "
             + ", ".join(missing)
-            + ". Install git-annex before using the streaming dataset helper."
+            + ". Install DataLad and git-annex before using streaming."
         )
 
 
@@ -102,43 +104,43 @@ def ensure_git_identity(root: Path) -> None:
             run(["git", "config", "--local", key, value], cwd=root)
 
 
-def enable_dataset(dataset_root: Path, dataset_branch: str = DEFAULT_DATASET_BRANCH) -> None:
-    """Clone/init the dataset and enable remotes used by the tested workflow."""
+def enable_dataset(
+    dataset_root: Path,
+    dataset_branch: str = DEFAULT_DATASET_BRANCH,
+) -> None:
+    """Install the Algonauts dataset recursively using DataLad."""
     require_commands()
     prepare_runtime()
 
+    dataset_root = dataset_root.absolute()
+
     if not (dataset_root / ".git").exists():
         dataset_root.parent.mkdir(parents=True, exist_ok=True)
-        run(["git", "clone", "--branch", dataset_branch, DATASET_URL, str(dataset_root)])
+        run(
+            [
+                "datalad",
+                "install",
+                "-r",
+                "-s",
+                DATASET_URL,
+                str(dataset_root),
+            ],
+            cwd=dataset_root.parent,
+        )
 
     ensure_git_identity(dataset_root)
-    run(["git", "annex", "info", "--fast"], cwd=dataset_root)
-    run_optional(["git", "annex", "enableremote", "algonauts.competitors"], cwd=dataset_root)
 
-    run(["git", "submodule", "sync", "--recursive"], cwd=dataset_root)
-    run(["git", "submodule", "update", "--init", "--recursive"], cwd=dataset_root)
-
-    ood = dataset_root / "stimuli" / "movies" / "ood"
-    s7 = dataset_root / "stimuli" / "movies" / "friends" / "s7"
-    transcripts = dataset_root / "stimuli" / "transcripts"
-
-    for root in (ood, s7, transcripts):
-        if root.exists():
-            ensure_git_identity(root)
-
-    if ood.exists():
-        run_optional(["git", "annex", "enableremote", "conp-ria-storage"], cwd=ood)
-        run_optional(["git", "annex", "enableremote", "conp-ria-storage-http"], cwd=ood)
-
-    if s7.exists():
-        for remote in (
-            "conp-ria-storage",
-            "conp-ria-storage-http",
-            "ria-sequoia-storage",
-            "ria-beluga-storage",
-        ):
-            run_optional(["git", "annex", "enableremote", remote], cwd=s7)
-
+    # Install registered subdatasets recursively without fetching content.
+    run(
+        [
+            "datalad",
+            "get",
+            "-n",
+            "-r",
+            ".",
+        ],
+        cwd=dataset_root,
+    )
 
 def episode_from_path(path: Path) -> str | None:
     match = EPISODE_RE.search(path.stem.lower())
@@ -217,50 +219,93 @@ def build_index(dataset_root: Path) -> StimulusIndex:
     )
 
 
-def repo_root(path: Path) -> Path:
-    result = subprocess.check_output(
-        ["git", "-C", str(path.parent), "rev-parse", "--show-toplevel"],
-        text=True,
-    ).strip()
-    return Path(result).resolve()
+def relative_paths(
+    dataset_root: Path,
+    paths: Iterable[Path],
+) -> list[str]:
+    dataset_root = dataset_root.absolute()
+    result: list[str] = []
 
-
-def relative_to_repo(path: Path, root: Path) -> str:
-    # Do not resolve annex symlinks: unavailable keys can point outside the
-    # worktree and are expected to be broken before git-annex get.
-    return str(path.absolute().relative_to(root.absolute())).replace(os.sep, "/")
-
-
-def annex_group(paths: Iterable[Path]) -> dict[Path, list[str]]:
-    groups: dict[Path, list[str]] = defaultdict(list)
     for path in paths:
-        root = repo_root(path)
-        groups[root].append(relative_to_repo(path, root))
-    return groups
+        path = path.absolute()
+        try:
+            rel = path.relative_to(dataset_root)
+        except ValueError as exc:
+            raise RuntimeError(f"Path is outside dataset root: {path}") from exc
+        result.append(str(rel).replace(os.sep, "/"))
+
+    return result
 
 
-def annex_get(paths: Iterable[Path], jobs: int = 8) -> None:
+def datalad_get(
+    dataset_root: Path,
+    paths: Iterable[Path],
+    jobs: int = 8,
+) -> None:
     paths = list(dict.fromkeys(paths))
     if not paths:
         return
     if jobs < 1:
         raise ValueError("jobs must be positive")
 
-    for root, relative_paths in annex_group(paths).items():
-        run(["git", "annex", "get", f"-J{jobs}", "--", *relative_paths], cwd=root)
-        run(["git", "annex", "unlock", "--", *relative_paths], cwd=root)
+    run(
+        [
+            "datalad",
+            "get",
+            f"-J{jobs}",
+            "--",
+            *relative_paths(dataset_root, paths),
+        ],
+        cwd=dataset_root,
+    )
 
 
-def annex_drop(paths: Iterable[Path]) -> None:
-    """Lock and safely drop files without --force."""
+def datalad_drop(
+    dataset_root: Path,
+    paths: Iterable[Path],
+) -> None:
+    """Drop materialised content while preserving dataset metadata."""
     paths = list(dict.fromkeys(paths))
     if not paths:
         return
 
-    for root, relative_paths in annex_group(paths).items():
-        run(["git", "annex", "lock", "--", *relative_paths], cwd=root)
-        run(["git", "annex", "drop", "--", *relative_paths], cwd=root)
+    run(
+        [
+            "datalad",
+            "drop",
+            "--",
+            *relative_paths(dataset_root, paths),
+        ],
+        cwd=dataset_root,
+    )
 
+
+# Compatibility aliases for existing extractors that still import annex_get
+# and annex_drop. The implementation is DataLad-native.
+_ACTIVE_DATASET_ROOT: Path | None = None
+
+
+def set_active_dataset_root(dataset_root: Path) -> None:
+    global _ACTIVE_DATASET_ROOT
+    _ACTIVE_DATASET_ROOT = dataset_root.absolute()
+
+
+def annex_get(paths: Iterable[Path], jobs: int = 8) -> None:
+    if _ACTIVE_DATASET_ROOT is None:
+        raise RuntimeError(
+            "Dataset root is not configured. "
+            "Call set_active_dataset_root(dataset_root) first."
+        )
+    datalad_get(_ACTIVE_DATASET_ROOT, paths, jobs=jobs)
+
+
+def annex_drop(paths: Iterable[Path]) -> None:
+    if _ACTIVE_DATASET_ROOT is None:
+        raise RuntimeError(
+            "Dataset root is not configured. "
+            "Call set_active_dataset_root(dataset_root) first."
+        )
+    datalad_drop(_ACTIVE_DATASET_ROOT, paths)
 
 @dataclass(frozen=True)
 class Batch:
@@ -311,7 +356,8 @@ def iter_materialized_batches(
     require_all: bool = True,
     drop_after: bool = True,
 ) -> Iterator[tuple[Batch, list[Path]]]:
-    """Yield materialised batches and optionally drop each after consumer use."""
+    """Yield DataLad-materialised batches and optionally drop each after use."""
+    set_active_dataset_root(dataset_root)
     index = build_index(dataset_root)
     selected_episodes = []
     for episode in index.episodes:
@@ -341,12 +387,12 @@ def iter_materialized_batches(
             include_transcript=include_transcript,
             require_all=require_all,
         )
-        annex_get(paths, jobs=annex_jobs)
+        datalad_get(dataset_root, paths, jobs=annex_jobs)
         try:
             yield batch, paths
         finally:
             if drop_after:
-                annex_drop(paths)
+                datalad_drop(dataset_root, paths)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -367,6 +413,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     args = build_parser().parse_args()
     enable_dataset(args.dataset_root, args.dataset_branch)
+    set_active_dataset_root(args.dataset_root)
     index = build_index(args.dataset_root)
 
     include_movie = args.content in ("movies", "both")
@@ -409,9 +456,9 @@ def main() -> None:
             print(path)
 
         if args.action == "get":
-            annex_get(paths, jobs=args.annex_jobs)
+            datalad_get(args.dataset_root, paths, jobs=args.annex_jobs)
         elif args.action == "drop":
-            annex_drop(paths)
+            datalad_drop(args.dataset_root, paths)
 
 
 if __name__ == "__main__":
