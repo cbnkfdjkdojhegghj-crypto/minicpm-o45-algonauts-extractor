@@ -45,6 +45,7 @@ from scripts.streaming_stimuli import (  # noqa: E402
     build_index,
     enable_dataset,
     make_batches,
+    set_active_dataset_root,
 )
 
 
@@ -293,10 +294,12 @@ def decode_audio_ffmpeg(path: Path, *, sample_rate: int) -> np.ndarray:
     if result.returncode != 0:
         message = result.stderr.decode("utf-8", errors="replace")[-4000:]
         raise RuntimeError(f"ffmpeg audio decode failed for {path}: {message}")
-    audio = np.frombuffer(result.stdout, dtype=np.float32)
+    # np.frombuffer() over subprocess stdout is a read-only view. Copy once so
+    # in-place sanitization is safe and the returned array owns writable memory.
+    audio = np.frombuffer(result.stdout, dtype=np.float32).copy()
     if audio.size == 0:
         raise RuntimeError(f"decoded empty audio from {path}")
-    audio = np.nan_to_num(audio, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+    np.nan_to_num(audio, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
     return np.ascontiguousarray(audio, dtype=np.float32)
 
 
@@ -927,6 +930,7 @@ def main() -> None:
     torch.set_num_interop_threads(cpu_interop_threads)
 
     enable_dataset(args.dataset_root, args.dataset_branch)
+    set_active_dataset_root(args.dataset_root)
     index = build_index(args.dataset_root)
 
     if args.episodes:
