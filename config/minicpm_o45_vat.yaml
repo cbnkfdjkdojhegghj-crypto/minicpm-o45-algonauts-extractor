@@ -1,0 +1,54 @@
+extractor:
+  name: minicpm_o_4_5_vat
+
+model:
+  id: openbmb/MiniCPM-o-4_5
+  revision: 503e754207c94da6bb26850b4469f367c9ea3582
+  dtype: bfloat16
+  frozen: true
+  trust_remote_code: true
+  attn_implementation: sdpa
+
+representation:
+  # BrainBridge paper layer numbering is 1-based.
+  # layer 18 == output of model.llm.model.layers[17].
+  production_layers: [18]
+  diagnostic_layers: [9, 18, 27, 36]
+  hidden_dim: 4096
+
+temporal:
+  tr: 1.49
+  chunk_length: 8.0
+  seconds_before_chunk: 4.0
+
+video:
+  frames_per_tr: 2
+  resize_width: 448
+  ffmpeg_threads: 2
+
+audio:
+  sample_rate: 16000
+
+pooling:
+  target_region: target_tr
+  temporal_mapping: proportional_valid_token_crop
+  statistics: [mean, sample_std]
+
+storage:
+  dtype: float16
+  pca: false
+
+diagnostics:
+  # Set >0 only for a pilot. Token states are large.
+  token_states_per_movie: 0
+
+runtime:
+  # Tuned for 4 CPU cores / 32 GB RAM / RTX PRO 6000 Blackwell 96 GB.
+  # One movie remains resident at a time; GPU batching is preferred over
+  # CPU-side parallelism on this machine.
+  inference_batch_size: 8
+  cpu_threads: 2
+  cpu_interop_threads: 1
+  max_input_length: 8192
+  max_slice_nums: 1
+  use_cache: false
